@@ -5,16 +5,20 @@ Created on Fri Jul 17 08:26:39 2020
 @author: Sashka
 """
 import os
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import numpy as np
 from scipy.interpolate import interpn
 from scipy.optimize import minimize
-from derivative import derivative
 from scipy.interpolate import Rbf
 import matplotlib.pyplot as plt
 import tensorflow as tf
+import torch
+from derivative import derivative
 
 tf.config.set_visible_devices([], 'GPU')
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def advanced_riffling(a, b):
     c = np.empty((a.size + b.size,), dtype=a.dtype)
@@ -24,28 +28,25 @@ def advanced_riffling(a, b):
 
 
 # @numba.jit
-def take_derivative(u, grid, dif_type,scheme_order=1,boundary_order=2):
-    const = dif_type[0]
-    var = dif_type[1]
-    order = dif_type[2]
-    power = dif_type[3]
+def take_derivative(u, grid, dif_type, scheme_order=1, boundary_order=2):
+    const, var, order, power = dif_type
+    var = 1 - var
     h = grid[var]
     der = u
     for i in range(order):
         # der = np.gradient(der, h, axis=var, edge_order=1)
-        der = derivative(der, h, var, scheme_order=scheme_order,boundary_order=boundary_order)
+        der = derivative(der, h, var, scheme_order=scheme_order, boundary_order=boundary_order)
         # der = derivative_4p(der, h, var)
     der = const * der ** power
-    der = np.array(der, dtype=np.float64)
     return der
 
 
-def apply_const_operator(u, grid, operator,scheme_order=1,boundary_order=2):
+def apply_const_operator(u, grid, operator, scheme_order=1, boundary_order=2):
     total = 0
     for term in operator:
         up = u
         for dif in term:
-            up = take_derivative(up, grid, dif, scheme_order=scheme_order,boundary_order=boundary_order)
+            up = take_derivative(up, grid, dif, scheme_order=scheme_order, boundary_order=boundary_order)
         total += up
     return total
 
@@ -58,23 +59,21 @@ def string_reshape(string, grid):
     return u
 
 
-def operator_norm(string, grid, operator, norm_lambda, bcond,scheme_order=1,boundary_order=2) -> float:
-    u = string_reshape(string, grid)
-    op = apply_const_operator(u, grid, operator, scheme_order=scheme_order,boundary_order=boundary_order)
+def operator_norm(u, grid, operator, norm_lambda, bcond, scheme_order=1, boundary_order=2) -> float:
+    op = apply_const_operator(u, grid, operator, scheme_order=scheme_order, boundary_order=boundary_order)
     bond = []
     for condition in bcond:
         bond_op = u
         if 'operator' in condition:
             bond_op = apply_const_operator(u, grid, condition['operator'])
 
-        bond.append(np.take(bond_op, condition['boundary'], condition['axis']) \
-                    - condition['string'])
+        ind = condition['boundary'] * torch.ones(u.shape, dtype=torch.long, device=device)
+        bond.append(torch.linalg.norm(torch.gather(bond_op, condition['axis'], ind) - condition['string']))
 
-    bond = list(map(np.linalg.norm, bond))
-    if np.allclose(u / np.max(u), np.zeros_like(u) + 1):
+    if torch.allclose(u / torch.max(u), torch.zeros_like(u) + 1):
         norm = 1e10
     else:
-        norm = np.linalg.norm(op) + norm_lambda * np.sum(bond)
+        norm = torch.linalg.norm(op) + norm_lambda * sum(bond)
     return norm
 
 
@@ -88,38 +87,39 @@ def solution_interp(grid, field, new_grid):
     return values
 
 
-def solution_interp_RBF(grid,field,new_grid,method='multiquadric',smooth=0):
-    mesh=np.meshgrid(*grid)
-    full_list=[mesh[i] for i in range(len(mesh))]
+def solution_interp_RBF(grid, field, new_grid, method='multiquadric', smooth=0):
+    mesh = np.meshgrid(*grid)
+    full_list = [mesh[i] for i in range(len(mesh))]
     full_list.append(field)
-    interp=Rbf(*full_list,method=method,smooth=smooth)
-    new_mesh= np.meshgrid(*new_grid)
-    values=interp(*new_mesh)
+    interp = Rbf(*full_list, method=method, smooth=smooth)
+    new_mesh = np.meshgrid(*new_grid)
+    values = interp(*new_mesh)
     return values
+
 
 # demonstrate data normalization with sklearn
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
-#Dependencies
+# Dependencies
 import keras
 from keras.models import Sequential
-from keras.layers import Dense,Dropout
+from keras.layers import Dense, Dropout
 
-from keras.callbacks import EarlyStopping 
+from keras.callbacks import EarlyStopping
 
 
-def solution_interp_nn(grid,matrix,new_grid):
-    matrix=np.array(matrix)
+def solution_interp_nn(grid, matrix, new_grid):
+    matrix = np.array(matrix)
     X, T = np.meshgrid(grid[1], grid[0])
-    grid_nn=np.array([X.reshape(-1),T.reshape(-1)]).T
-    u_nn=matrix.reshape(-1)
+    grid_nn = np.array([X.reshape(-1), T.reshape(-1)]).T
+    u_nn = matrix.reshape(-1)
     # create scaler
     scaler = MinMaxScaler()
     # fit scaler on data
-    scaler.fit(u_nn.reshape(-1,1))
+    scaler.fit(u_nn.reshape(-1, 1))
     # apply transform
-    normalized = scaler.transform(u_nn.reshape(-1,1))
-    X_train,X_test,y_train,y_test = train_test_split(grid_nn,normalized,test_size = 0.1)
+    normalized = scaler.transform(u_nn.reshape(-1, 1))
+    X_train, X_test, y_train, y_test = train_test_split(grid_nn, normalized, test_size=0.1)
     # Neural network
     model = Sequential()
     model = Sequential()
@@ -127,25 +127,26 @@ def solution_interp_nn(grid,matrix,new_grid):
     model.add(Dense(64, activation='relu'))
     model.add(Dense(1024, activation='relu'))
     model.add(Dense(1, activation='relu'))
-    
+
     model.compile(loss="mean_squared_error", optimizer='adam')
-    Callback=EarlyStopping(monitor='loss', min_delta=0, patience=20)
+    Callback = EarlyStopping(monitor='loss', min_delta=0, patience=20)
     # Callback=EarlyStopping(monitor='loss', min_delta=0, patience=300)
-    history = model.fit(X_train, y_train,validation_data = (X_test,y_test), epochs=10000000000, batch_size=128,verbose=0, callbacks=[Callback])
+    history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=10000000000, batch_size=128,
+                        verbose=0, callbacks=[Callback])
 
     X, T = np.meshgrid(new_grid[1], new_grid[0])
 
-    grid_interp=np.array([X.reshape(-1),T.reshape(-1)]).T
+    grid_interp = np.array([X.reshape(-1), T.reshape(-1)]).T
 
-    u_interp=[]
+    u_interp = []
 
-    u_interp=model.predict(grid_interp)
+    u_interp = model.predict(grid_interp)
 
     # inverse transform
-    inverse = scaler.inverse_transform(u_interp.reshape(-1,1))
-    inverse=inverse.reshape([len(new_grid[0]),len(new_grid[1])])
-    if np.allclose(inverse/np.max(inverse),np.zeros_like(inverse)+1):
-        inverse=np.random.random((len(new_grid[0]),len(new_grid[1])))
+    inverse = scaler.inverse_transform(u_interp.reshape(-1, 1))
+    inverse = inverse.reshape([len(new_grid[0]), len(new_grid[1])])
+    if np.allclose(inverse / np.max(inverse), np.zeros_like(inverse) + 1):
+        inverse = np.random.random((len(new_grid[0]), len(new_grid[1])))
     return inverse
 
 
@@ -273,6 +274,7 @@ def gradient_opt(matrix, grid, operator, operator_lambda):
         if np.abs(norm_before - norm_after) == 0: break
     sln = string_reshape(opt.x, grid)
     return sln
+
 
 def plot_3D_surface(surf, solution, grid):
     X, T = np.meshgrid(grid[1], grid[0])
