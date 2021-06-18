@@ -77,6 +77,25 @@ def operator_norm(u, grid, operator, norm_lambda, bcond, scheme_order=1, boundar
     return norm
 
 
+def operator_norm_derivative(u, grid, operator, norm_lambda, bcond, scheme_order=1, boundary_order=2):
+    op = apply_const_operator(u, grid, operator, scheme_order=scheme_order, boundary_order=boundary_order)
+    bond = []
+    for condition in bcond:
+        bond_op = u
+        if 'operator' in condition:
+            bond_op = apply_const_operator(u, grid, condition['operator'])
+
+        ind = condition['boundary'] * torch.ones(u.shape, dtype=torch.long, device=device)
+        bond_op = torch.gather(bond_op, condition['axis'], ind) - condition['string']
+        bond.append(norm_lambda * bond_op / torch.linalg.norm(bond_op))
+
+    if torch.allclose(u / torch.max(u), torch.zeros_like(u) + 1):
+        norm = 1e10
+    else:
+        norm = torch.linalg.norm(op)
+
+    return op / norm + sum(bond)
+
 def solution_interp(grid, field, new_grid):
     values = []
     for i in range(len(new_grid[0])):

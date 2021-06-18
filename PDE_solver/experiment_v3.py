@@ -17,6 +17,7 @@ import tensorflow as tf
 tf.config.set_visible_devices([], 'GPU')
 
 from scipy.optimize import minimize
+import scipy as sp
 # from scipy.optimize import differential_evolution
 # from scipy.optimize import dual_annealing
 import numba
@@ -25,7 +26,8 @@ import matplotlib.pyplot as plt
 
 import torch
 
-from PDE_solver import string_reshape, plot_3D_surface, operator_norm, solution_interp_nn, solution_interp_RBF, solution_interp
+from PDE_solver import string_reshape, plot_3D_surface, operator_norm, solution_interp_nn, solution_interp_RBF, \
+    solution_interp, operator_norm_derivative
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 plt.rcParams["figure.max_open_warning"] = 1000
@@ -81,19 +83,59 @@ def init_field_expetiment(nrun=1, grid_scenario=[[10, 10]], interp_type='random'
 
         wolfram_interp = np.genfromtxt(exact_sln, delimiter=',')
 
-        params = torch.from_numpy(arr).to(device)
-        params.requires_grad_()
-
-        optimizer = torch.optim.LBFGS([params],
-                                      # lr=1e-3,
-                                      # tolerance_change=5e-15,
-                                      max_iter=3000,
-                                      # tolerance_grad=1e-10,
-                                      line_search_fn="strong_wolfe",
-                                      history_size=200,
-                                      )
+        arr = torch.from_numpy(arr).to(device)
 
         operator = [[(1, 0, 2, 1)], [(-1 / 4, 1, 2, 1)]]
+
+        def bfgs_method(f, fprime, params, x0, maxiter=None, epsi=10e-3):
+
+            if maxiter is None:
+                maxiter = 1000
+
+            k = 0
+
+            field_shape = x0.shape
+
+            gfk = fprime(x0, *params)
+
+            gfk = torch.flatten(gfk)
+            x0 = torch.flatten(x0)
+
+            N = int(x0.shape[0])
+
+            I = torch.eye(N, dtype=torch.float64, device=device)
+            Hk = I
+            xk = x0
+
+            while torch.linalg.norm(gfk).item() > epsi and k < maxiter:
+                # pk - direction of search
+
+                pk = -torch.matmul(Hk, gfk)
+
+                # line_search = sp.optimize.line_search(lambda x: f(torch.from_numpy(x), *params).cpu().numpy(), lambda x: fprime(torch.from_numpy(x), *params).cpu().numpy(), xk.cpu().numpy(), pk.cpu().numpy())
+                # alpha_k = line_search[0]
+
+                alpha_k = 1
+
+                xkp1 = xk + alpha_k * pk
+                sk = xkp1 - xk
+                xk = xkp1
+
+                gfkp1 = fprime(xkp1.view(field_shape), *params)
+                gfkp1 = torch.flatten(gfkp1)
+
+                yk = gfkp1 - gfk
+                gfk = gfkp1
+
+                k += 1
+
+                ro = 1.0 / (torch.matmul(yk, sk))
+
+                A1 = I - ro * torch.outer(sk, yk)
+                A2 = I - ro * torch.outer(yk, yk)
+                Hk = torch.matmul(A1, torch.matmul(Hk, A2)) + (ro * torch.outer(sk, sk))
+
+            return (xk.view(field_shape), k)
 
         start_time = time.time()
         operator_norm_1 = lambda x: operator_norm(x,
@@ -105,41 +147,28 @@ def init_field_expetiment(nrun=1, grid_scenario=[[10, 10]], interp_type='random'
                                                   boundary_order=diff_scheme[1])
         # opt = minimize(operator_norm_1, arr.reshape(-1),options={'disp': True, 'maxiter': 3000}, tol=0.05)
 
-        cur_loss = float('inf')
-        tol = 1e-15
+        params = [grid, operator, norm_bond, bcond]
+        result, k = bfgs_method(operator_norm_1, operator_norm_derivative, params, arr)
 
-        for i in range(10000):
-            past_loss = cur_loss
-
-            def closure():
-                nonlocal cur_loss
-                optimizer.zero_grad()
-                loss = operator_norm_1(params)
-                loss.backward()
-                cur_loss = loss.item()
-                return loss
-
-            optimizer.step(closure)
-
-            if abs(cur_loss - past_loss) / abs(cur_loss) < tol:
-                print("number of steps ", i)
-                break
+        print('Result of BFGS method:')
+        print('Final Result (best point): %s' % (result))
+        print('Iteration Count: %s' % (k))
 
         elapsed_time = time.time() - start_time
 
-        print(operator_norm_1(params))
+        print(operator_norm_1(result))
         print(f'[{datetime.datetime.now()}] grid_x = {grid_res[0]} grid_t={grid_res[1]} time = {elapsed_time}')
 
-        full_sln_interp = string_reshape(params, new_grid)
+        full_sln_interp = string_reshape(result, new_grid)
         # print(full_sln_interp)
-        error = np.abs(full_sln_interp.detach().cpu().numpy() - wolfram_interp)
+        error = np.abs(result.cpu().numpy() - wolfram_interp)
         max_error = np.max(error)
         wolfram_MAE = np.mean(error)
-        print(max_error)
-        print(wolfram_MAE)
+        print('Max error', max_error)
+        print('Mean error', wolfram_MAE)
         arr = full_sln_interp
 
-        plot_3D_surface(full_sln_interp.detach().cpu().numpy(), wolfram_interp, new_grid)
+        plot_3D_surface(result.cpu().numpy(), wolfram_interp, new_grid)
 
         experiment.append(
             {'grid_x': len(x), 'grid_t': len(t), 'time': elapsed_time, 'MAE': wolfram_MAE, 'max_err': max_error,
@@ -168,9 +197,4 @@ results = init_field_expetiment(grid_scenario=[[10, 10]])
 #         for result in results:
 #             df=df.append(result,ignore_index=True)
 #         df.to_csv(f'interp_v3_{datetime.datetime.now().timestamp()}.csv',index=False)
-
-
-
-
-
 
